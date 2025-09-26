@@ -1,168 +1,187 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# rw-local-tunnel start|stop
-# Adds/removes a UFW rule to allow inbound from the VPS's Tailscale IP
-# to a local TCP port (so NPM on the VPS can reach your dev app).
-#
-# Env overrides:
-#   VPS_NAME=vpn          # Headscale/Tailscale HostName of the VPS
-#   TAILNET_CIDR=100.64.0.0/10
-#   DEFAULT_SCOPE=vps     # vps|tailnet (default selection on start)
+# rw-local-tunnel start|stop|shields on|off
+# - start: add UFW allow (VPS-only by default), remove any nft drop for that port
+# - stop:  insert nftables DROP on tailscale0:dport PORT, remove UFW allows
+# - shields: toggle Tailscale "shields up" (global inbound block)
 
 VPS_NAME="${VPS_NAME:-vpn}"
 TAILNET_CIDR="${TAILNET_CIDR:-100.64.0.0/10}"
-DEFAULT_SCOPE="${DEFAULT_SCOPE:-vps}"
+DEFAULT_SCOPE="${DEFAULT_SCOPE:-vps}"   # vps|tailnet
+NFT_TABLE="inet"
+NFT_FAMILY="inet"
+NFT_TABLE_NAME="rwlt"
+NFT_CHAIN_NAME="input"
+NFT_PRIO="-450"   # very early in INPUT, before Tailscale's chains
+
 STATE_DIR="${HOME}/.config/rw-local-tunnel"
 mkdir -p "$STATE_DIR"
 
-die() { echo "ERROR: $*" >&2; exit 1; }
-
-need_sudo() {
+die(){ echo "ERROR: $*" >&2; exit 1; }
+need_sudo(){
   if [[ $EUID -ne 0 ]]; then
-    exec sudo --preserve-env=VPS_NAME,TAILNET_CIDR,DEFAULT_SCOPE,STATE_DIR "$0" "$@"
+    exec sudo --preserve-env=VPS_NAME,TAILNET_CIDR,DEFAULT_SCOPE,STATE_DIR,NFT_PRIO,NFT_TABLE_NAME,NFT_CHAIN_NAME "$0" "$@"
   fi
 }
-
-ts_ip_self() { tailscale ip -4 2>/dev/null | head -n1 || true; }
-
-ts_ip_vps() {
-  tailscale status --json 2>/dev/null \
-  | jq -r --arg n "$VPS_NAME" '
-      [ .Peer[]? | select(.HostName==$n) | .TailscaleIPs[] | select(test(":")|not) ][0] // empty'
-}
-
-ensure_tools() {
+ensure_tools(){
   command -v tailscale >/dev/null || die "tailscale CLI not found"
   command -v jq >/dev/null || die "jq not found (sudo apt install -y jq)"
+  command -v nft >/dev/null || die "nftables not found (sudo apt install -y nftables)"
 }
-
-ensure_ufw_enabled() {
+ts_ip_self(){ tailscale ip -4 2>/dev/null | head -n1 || true; }
+ts_ip_vps(){
+  tailscale status --json 2>/dev/null \
+  | jq -r --arg n "$VPS_NAME" '[.Peer[]? | select(.HostName==$n) | .TailscaleIPs[] | select(test(":")|not)][0] // empty'
+}
+ensure_ufw(){
   if ufw status 2>/dev/null | grep -qi "Status: inactive"; then
     read -rp "UFW is inactive. Enable it now? [y/N]: " A
     [[ "${A,,}" == "y" ]] || die "UFW inactive; aborting."
     ufw --force enable
   fi
 }
-
-prompt_port() {
-  local last
-  if [[ -f "$STATE_DIR/last_port" ]]; then last=$(cat "$STATE_DIR/last_port"); fi
-  read -rp "Local TCP port to allow${last:+ [$last]}: " PORT
+prompt_port(){
+  local last; [[ -f "$STATE_DIR/last_port" ]] && last=$(cat "$STATE_DIR/last_port") || last=""
+  read -rp "Local TCP port${last:+ [$last]}: " PORT
   PORT="${PORT:-$last}"
   [[ "$PORT" =~ ^[0-9]{1,5}$ && $PORT -ge 1 && $PORT -le 65535 ]] || die "Invalid port"
   echo -n "$PORT" > "$STATE_DIR/last_port"
   echo "$PORT"
 }
-
-pick_scope() {
+pick_scope(){
   local vps_ip="$1"
   echo "Allow from which source?"
   echo "  1) VPS only ($vps_ip/32)   [recommended]"
   echo "  2) Whole tailnet ($TAILNET_CIDR)"
   local def="1"; [[ "$DEFAULT_SCOPE" == "tailnet" ]] && def="2"
-  read -rp "Choose 1 or 2 [$def]: " CHOICE
-  CHOICE="${CHOICE:-$def}"
-  if [[ "$CHOICE" == "2" ]]; then
-    echo "$TAILNET_CIDR"
-  else
-    echo "$vps_ip/32"
+  read -rp "Choose 1 or 2 [$def]: " CHOICE; CHOICE="${CHOICE:-$def}"
+  [[ "$CHOICE" == "2" ]] && echo "$TAILNET_CIDR" || echo "$vps_ip/32"
+}
+nft_ensure_chain(){
+  # Create our own early INPUT chain if missing
+  if ! nft list table ${NFT_FAMILY} ${NFT_TABLE_NAME} >/dev/null 2>&1; then
+    nft add table ${NFT_FAMILY} ${NFT_TABLE_NAME}
+  fi
+  if ! nft list chain ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} >/dev/null 2>&1; then
+    nft add chain ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} "{ type filter hook input priority ${NFT_PRIO}; policy accept; }"
   fi
 }
-
-add_rule() {
-  local SRC="$1" PORT="$2" COMMENT="rwlt:$PORT"
-  local RULE="from $SRC to any port $PORT proto tcp"
-  if ufw status numbered | grep -qF "$RULE"; then
-    echo "Rule already present: $RULE"
+nft_add_drop(){
+  local port="$1"
+  nft_ensure_chain
+  # Idempotent: check if rule exists
+  if nft list chain ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} | grep -q "iif \"tailscale0\" tcp dport ${port} counter drop"; then
+    echo "nft drop already present for tailscale0 tcp dport ${port}"
   else
-    ufw allow $RULE comment "$COMMENT"
-    echo "Added: ufw allow $RULE (comment: $COMMENT)"
+    nft add rule ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} iif "tailscale0" tcp dport ${port} counter drop
+    echo "Added nft drop on tailscale0 tcp dport ${port}"
   fi
 }
-
-remove_rule() {
-  local PORT="$1"
-  # Prefer deleting by our comment
-  local nums
-  mapfile -t nums < <(ufw status numbered | sed -n 's/^\[\s*\([0-9]\+\)\]\s\+\(.*\) (rwlt:'"$PORT"')$/\1/p')
+nft_del_drop(){
+  local port="$1"
+  if nft list chain ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} >/dev/null 2>&1; then
+    # delete all matching rules (if multiple)
+    while nft list chain ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} | grep -q "iif \"tailscale0\" tcp dport ${port} counter drop"; do
+      nft delete rule ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} handle $(nft -a list chain ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} | awk "/iif \"tailscale0\" tcp dport ${port} counter drop/ {print \$NF}" | head -n1)
+    done
+    echo "Removed nft drop for port ${port} (if any)"
+  fi
+}
+ufw_add_allow(){
+  local src="$1" port="$2" comment="rwlt:${port}"
+  local rule="from $src to any port $port proto tcp"
+  if ufw status numbered | grep -qF "$rule"; then
+    echo "UFW rule already present: $rule"
+  else
+    ufw allow $rule comment "$comment"
+    echo "Added UFW allow: $rule"
+  fi
+}
+ufw_del_all_for_port(){
+  local port="$1"
+  # delete rules we tagged
+  mapfile -t nums < <(ufw status numbered | sed -n 's/^\[\s*\([0-9]\+\)\]\s\+\(.*\) (rwlt:'"$port"')$/\1/p')
   if (( ${#nums[@]} )); then
-    for n in "${nums[@]}"; do ufw --force delete "$n"; echo "Deleted rule #$n (rwlt:$PORT)"; done
-    return 0
+    for n in "${nums[@]}"; do ufw --force delete "$n"; done
+    echo "Removed UFW rules tagged rwlt:${port}"
   fi
-  # Fallback: try both possible sources
-  local vps_ip=""; if command -v tailscale >/dev/null; then vps_ip=$(ts_ip_vps || true); fi
+  # also remove generic allows for common sources (VPS-only + tailnet)
+  local vps_ip; vps_ip="$(ts_ip_vps || true)"
   for SRC in ${vps_ip:+$vps_ip/32} "$TAILNET_CIDR"; do
     [[ -z "$SRC" ]] && continue
-    local RULE="from $SRC to any port $PORT proto tcp"
-    if ufw status numbered | grep -qF "$RULE"; then
-      ufw delete allow $RULE
-      echo "Deleted: ufw delete allow $RULE"
+    local rule="from $SRC to any port $port proto tcp"
+    if ufw status numbered | grep -qF "$rule"; then
+      ufw delete allow $rule
+      echo "Removed UFW allow: $rule"
     fi
   done
 }
-
-warn_loopback() {
-  local PORT="$1"
+warn_loopback(){
+  local port="$1"
   if command -v ss >/dev/null 2>&1; then
-    echo; echo "Listening sockets on port $PORT:"
-    ss -lntp | awk -v p=":$PORT" 'NR==1 || $4 ~ p {print}'
+    echo; echo "Listening sockets on port $port:"
+    ss -lntp | awk -v p=":$port" 'NR==1 || $4 ~ p {print}'
     local non_loop
-    non_loop=$(ss -lntpH "sport = :$PORT" | awk '{print $4}' | grep -vE '(^127\.0\.0\.1|^::1)' | wc -l)
+    non_loop=$(ss -lntpH "sport = :$port" | awk '{print $4}' | grep -vE '(^127\.0\.0\.1|^::1)' | wc -l)
     if [[ "$non_loop" -eq 0 ]]; then
       echo "WARNING: service appears bound only to 127.0.0.1."
-      echo "Bind to 0.0.0.0 (or your Tailscale interface) so the VPS can reach it."
+      echo "Bind to 0.0.0.0 (or your Tailscale iface) so the VPS can reach it."
     fi
   fi
 }
 
-cmd_start() {
-  ensure_tools
-  need_sudo
-  local self_ip vps_ip port src
-  self_ip=$(ts_ip_self || true)
-  [[ -n "$self_ip" ]] && echo "This machine's Tailscale IPv4: $self_ip"
-
-  vps_ip=$(ts_ip_vps || true)
-  if [[ -z "$vps_ip" ]]; then
-    read -rp "VPS Tailscale IPv4 not auto-detected. Enter it (e.g. 100.64.0.2): " vps_ip
-  fi
-  [[ "$vps_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "Invalid IPv4: $vps_ip"
-
-  port=$(prompt_port)
-  src=$(pick_scope "$vps_ip")
-
-  ensure_ufw_enabled
-  add_rule "$src" "$port"
+cmd_start(){
+  ensure_tools; need_sudo
+  local self vps port src
+  self="$(ts_ip_self || true)"; [[ -n "$self" ]] && echo "This machine's Tailscale IPv4: $self"
+  vps="$(ts_ip_vps || true)";  [[ -z "$vps" ]] && read -rp "VPS Tailscale IPv4 (e.g. 100.64.0.2): " vps
+  [[ "$vps" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "Invalid IPv4: $vps"
+  port="$(prompt_port)"
+  src="$(pick_scope "$vps")"
+  ensure_ufw
+  nft_del_drop "$port"                  # ensure no hard block remains
+  ufw_add_allow "$src" "$port"
   warn_loopback "$port"
-
-  echo; echo "Done. To stop later: rw-local-tunnel stop"
+  echo; echo "✅ Port ${port} opened for ${src} over Tailscale."
+  echo "To stop later: rw-local-tunnel stop"
 }
 
-cmd_stop() {
+cmd_stop(){
   need_sudo
-  local port
-  port=$(prompt_port)
-  remove_rule "$port"
+  local port; port="$(prompt_port)"
+  nft_add_drop "$port"                  # hard block on tailscale0
+  ufw_del_all_for_port "$port"          # clean any allows
+  echo; echo "🛑 Port ${port} blocked on tailscale0. (NPM will now fail to reach it.)"
 }
 
-usage() {
-  cat <<EOF
-Usage: rw-local-tunnel <start|stop>
+cmd_shields(){
+  ensure_tools; need_sudo
+  case "${1:-}" in
+    on)  tailscale set --shields-up=true;  echo "Shields Up enabled (all inbound blocked).";;
+    off) tailscale set --shields-up=false; echo "Shields Up disabled.";;
+    *)   echo "Usage: rw-local-tunnel shields on|off"; exit 1;;
+  esac
+}
 
-start  - Add UFW allow from VPS (default) or whole tailnet to a local TCP port.
-stop   - Remove the UFW rule for that port.
+usage(){
+  cat <<EOF
+Usage:
+  rw-local-tunnel start      # open a local port to VPS (or tailnet), remove any nft drop
+  rw-local-tunnel stop       # hard-block that port on tailscale0 and remove UFW allows
+  rw-local-tunnel shields on|off   # optional global inbound toggle
 
 Env:
-  VPS_NAME=<host>        (default: vpn)
+  VPS_NAME=<host>            (default: vpn)
   DEFAULT_SCOPE=vps|tailnet  (default: vps)
 EOF
 }
 
-main() {
+main(){
   case "${1:-}" in
     start) shift; cmd_start "$@";;
     stop)  shift; cmd_stop  "$@";;
+    shields) shift; cmd_shields "$@";;
     *) usage; exit 1;;
   esac
 }
