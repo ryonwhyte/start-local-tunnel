@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# rw-local-tunnel start|stop
+# Adds/removes a UFW rule to allow inbound from the VPS's Tailscale IP
+# to a local TCP port (so NPM on the VPS can reach your dev app).
+#
+# Env overrides:
+#   VPS_NAME=vpn          # Headscale/Tailscale HostName of the VPS
+#   TAILNET_CIDR=100.64.0.0/10
+#   DEFAULT_SCOPE=vps     # vps|tailnet (default selection on start)
+
+VPS_NAME="${VPS_NAME:-vpn}"
+TAILNET_CIDR="${TAILNET_CIDR:-100.64.0.0/10}"
+DEFAULT_SCOPE="${DEFAULT_SCOPE:-vps}"
+STATE_DIR="${HOME}/.config/rw-local-tunnel"
+mkdir -p "$STATE_DIR"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+need_sudo() {
+  if [[ $EUID -ne 0 ]]; then
+    exec sudo --preserve-env=VPS_NAME,TAILNET_CIDR,DEFAULT_SCOPE,STATE_DIR "$0" "$@"
+  fi
+}
+
+ts_ip_self() { tailscale ip -4 2>/dev/null | head -n1 || true; }
+
+ts_ip_vps() {
+  tailscale status --json 2>/dev/null \
+  | jq -r --arg n "$VPS_NAME" '
+      [ .Peer[]? | select(.HostName==$n) | .TailscaleIPs[] | select(test(":")|not) ][0] // empty'
+}
+
+ensure_tools() {
+  command -v tailscale >/dev/null || die "tailscale CLI not found"
+  command -v jq >/dev/null || die "jq not found (sudo apt install -y jq)"
+}
+
+ensure_ufw_enabled() {
+  if ufw status 2>/dev/null | grep -qi "Status: inactive"; then
+    read -rp "UFW is inactive. Enable it now? [y/N]: " A
+    [[ "${A,,}" == "y" ]] || die "UFW inactive; aborting."
+    ufw --force enable
+  fi
+}
+
+prompt_port() {
+  local last
+  if [[ -f "$STATE_DIR/last_port" ]]; then last=$(cat "$STATE_DIR/last_port"); fi
+  read -rp "Local TCP port to allow${last:+ [$last]}: " PORT
+  PORT="${PORT:-$last}"
+  [[ "$PORT" =~ ^[0-9]{1,5}$ && $PORT -ge 1 && $PORT -le 65535 ]] || die "Invalid port"
+  echo -n "$PORT" > "$STATE_DIR/last_port"
+  echo "$PORT"
+}
+
+pick_scope() {
+  local vps_ip="$1"
+  echo "Allow from which source?"
+  echo "  1) VPS only ($vps_ip/32)   [recommended]"
+  echo "  2) Whole tailnet ($TAILNET_CIDR)"
+  local def="1"; [[ "$DEFAULT_SCOPE" == "tailnet" ]] && def="2"
+  read -rp "Choose 1 or 2 [$def]: " CHOICE
+  CHOICE="${CHOICE:-$def}"
+  if [[ "$CHOICE" == "2" ]]; then
+    echo "$TAILNET_CIDR"
+  else
+    echo "$vps_ip/32"
+  fi
+}
+
+add_rule() {
+  local SRC="$1" PORT="$2" COMMENT="rwlt:$PORT"
+  local RULE="from $SRC to any port $PORT proto tcp"
+  if ufw status numbered | grep -qF "$RULE"; then
+    echo "Rule already present: $RULE"
+  else
+    ufw allow $RULE comment "$COMMENT"
+    echo "Added: ufw allow $RULE (comment: $COMMENT)"
+  fi
+}
+
+remove_rule() {
+  local PORT="$1"
+  # Prefer deleting by our comment
+  local nums
+  mapfile -t nums < <(ufw status numbered | sed -n 's/^\[\s*\([0-9]\+\)\]\s\+\(.*\) (rwlt:'"$PORT"')$/\1/p')
+  if (( ${#nums[@]} )); then
+    for n in "${nums[@]}"; do ufw --force delete "$n"; echo "Deleted rule #$n (rwlt:$PORT)"; done
+    return 0
+  fi
+  # Fallback: try both possible sources
+  local vps_ip=""; if command -v tailscale >/dev/null; then vps_ip=$(ts_ip_vps || true); fi
+  for SRC in ${vps_ip:+$vps_ip/32} "$TAILNET_CIDR"; do
+    [[ -z "$SRC" ]] && continue
+    local RULE="from $SRC to any port $PORT proto tcp"
+    if ufw status numbered | grep -qF "$RULE"; then
+      ufw delete allow $RULE
+      echo "Deleted: ufw delete allow $RULE"
+    fi
+  done
+}
+
+warn_loopback() {
+  local PORT="$1"
+  if command -v ss >/dev/null 2>&1; then
+    echo; echo "Listening sockets on port $PORT:"
+    ss -lntp | awk -v p=":$PORT" 'NR==1 || $4 ~ p {print}'
+    local non_loop
+    non_loop=$(ss -lntpH "sport = :$PORT" | awk '{print $4}' | grep -vE '(^127\.0\.0\.1|^::1)' | wc -l)
+    if [[ "$non_loop" -eq 0 ]]; then
+      echo "WARNING: service appears bound only to 127.0.0.1."
+      echo "Bind to 0.0.0.0 (or your Tailscale interface) so the VPS can reach it."
+    fi
+  fi
+}
+
+cmd_start() {
+  ensure_tools
+  need_sudo
+  local self_ip vps_ip port src
+  self_ip=$(ts_ip_self || true)
+  [[ -n "$self_ip" ]] && echo "This machine's Tailscale IPv4: $self_ip"
+
+  vps_ip=$(ts_ip_vps || true)
+  if [[ -z "$vps_ip" ]]; then
+    read -rp "VPS Tailscale IPv4 not auto-detected. Enter it (e.g. 100.64.0.2): " vps_ip
+  fi
+  [[ "$vps_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "Invalid IPv4: $vps_ip"
+
+  port=$(prompt_port)
+  src=$(pick_scope "$vps_ip")
+
+  ensure_ufw_enabled
+  add_rule "$src" "$port"
+  warn_loopback "$port"
+
+  echo; echo "Done. To stop later: rw-local-tunnel stop"
+}
+
+cmd_stop() {
+  need_sudo
+  local port
+  port=$(prompt_port)
+  remove_rule "$port"
+}
+
+usage() {
+  cat <<EOF
+Usage: rw-local-tunnel <start|stop>
+
+start  - Add UFW allow from VPS (default) or whole tailnet to a local TCP port.
+stop   - Remove the UFW rule for that port.
+
+Env:
+  VPS_NAME=<host>        (default: vpn)
+  DEFAULT_SCOPE=vps|tailnet  (default: vps)
+EOF
+}
+
+main() {
+  case "${1:-}" in
+    start) shift; cmd_start "$@";;
+    stop)  shift; cmd_stop  "$@";;
+    *) usage; exit 1;;
+  esac
+}
+main "$@"
