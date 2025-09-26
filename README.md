@@ -1,7 +1,10 @@
 # Install
 mkdir -p ~/bin
+
 nano ~/bin/rw-local-tunnel    # paste the script
+
 chmod +x ~/bin/rw-local-tunnel
+
 sudo ln -sf ~/bin/rw-local-tunnel /usr/local/bin/rw-local-tunnel
 
 # Use
