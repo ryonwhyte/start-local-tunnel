@@ -9,6 +9,7 @@ sudo ln -sf ~/bin/rw-local-tunnel /usr/local/bin/rw-local-tunnel
 
 # Use
 rw-local-tunnel start   # prompts for port, adds scoped allow
+
 rw-local-tunnel stop    # prompts for port, removes it
 
 
