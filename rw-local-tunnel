@@ -1,188 +1,715 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# rw-local-tunnel start|stop|shields on|off
-# - start: add UFW allow (VPS-only by default), remove any nft drop for that port
-# - stop:  insert nftables DROP on tailscale0:dport PORT, remove UFW allows
-# - shields: toggle Tailscale "shields up" (global inbound block)
+# rw-local-tunnel start [PORT]
+# rw-local-tunnel stop  [PORT]
+# rw-local-tunnel monitor [PORT]
+# rw-local-tunnel shields on|off
 
 VPS_NAME="${VPS_NAME:-vpn}"
 TAILNET_CIDR="${TAILNET_CIDR:-100.64.0.0/10}"
-DEFAULT_SCOPE="${DEFAULT_SCOPE:-vps}"   # vps|tailnet
-NFT_TABLE="inet"
-NFT_FAMILY="inet"
-NFT_TABLE_NAME="rwlt"
-NFT_CHAIN_NAME="input"
-NFT_PRIO="-450"   # very early in INPUT, before Tailscale's chains
-
+DEFAULT_SCOPE="${DEFAULT_SCOPE:-vps}"
 STATE_DIR="${HOME}/.config/rw-local-tunnel"
+NFT_FAMILY="inet"
+NFT_TABLE="rwlt"
+NFT_CHAIN="input"
+NFT_PRIO="-450"
+
 mkdir -p "$STATE_DIR"
 
-die(){ echo "ERROR: $*" >&2; exit 1; }
-need_sudo(){
-  if [[ $EUID -ne 0 ]]; then
-    exec sudo --preserve-env=VPS_NAME,TAILNET_CIDR,DEFAULT_SCOPE,STATE_DIR,NFT_PRIO,NFT_TABLE_NAME,NFT_CHAIN_NAME "$0" "$@"
+die(){ echo "❌ ERROR: $*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+# --- helpers ---
+check_tailscale_installation(){
+  if ! command -v tailscale >/dev/null 2>&1; then
+    echo "❌ Tailscale is not installed on this system"
+    echo
+    echo "📦 Install options:"
+    echo "   1. Official Tailscale: https://tailscale.com/download"
+    echo "   2. Trayscale (GUI): https://github.com/DeedleFake/trayscale"
+    echo "   3. Package manager:"
+    
+    if command -v apt >/dev/null 2>&1; then
+      echo "      sudo apt install tailscale"
+    elif command -v yum >/dev/null 2>&1; then
+      echo "      sudo yum install tailscale"
+    elif command -v pacman >/dev/null 2>&1; then
+      echo "      sudo pacman -S tailscale"
+    elif command -v brew >/dev/null 2>&1; then
+      echo "      brew install tailscale"
+    fi
+    
+    echo
+    die "Please install Tailscale and try again"
   fi
 }
-ensure_tools(){
-  command -v tailscale >/dev/null || die "tailscale CLI not found"
-  command -v jq >/dev/null || die "jq not found (sudo apt install -y jq)"
-  command -v nft >/dev/null || die "nftables not found (sudo apt install -y nftables)"
+
+check_tailscale_status(){
+  local status
+  
+  # Check if tailscaled daemon is running
+  if ! pgrep -x "tailscaled" >/dev/null 2>&1; then
+    echo "⚠️  Tailscale daemon (tailscaled) is not running"
+    
+    # Try to start it
+    echo "🔄 Attempting to start Tailscale daemon..."
+    
+    if systemctl is-enabled tailscaled >/dev/null 2>&1; then
+      if systemctl start tailscaled 2>/dev/null; then
+        echo "✅ Tailscale daemon started successfully"
+        sleep 2  # Give it a moment to initialize
+      else
+        echo "❌ Failed to start Tailscale daemon via systemctl"
+        echo "💡 Try manually: sudo systemctl start tailscaled"
+        return 1
+      fi
+    else
+      echo "❌ Tailscale daemon service not found or not enabled"
+      echo "💡 Try manually starting Tailscale or check your installation"
+      return 1
+    fi
+  fi
+  
+  # Check if we're logged in to Tailscale
+  status=$(tailscale status --json 2>/dev/null || echo '{"BackendState":""}')
+  local backend_state
+  backend_state=$(echo "$status" | jq -r '.BackendState // "Unknown"' 2>/dev/null || echo "Unknown")
+  
+  case "$backend_state" in
+    "Running")
+      echo "✅ Tailscale is running and connected"
+      return 0
+      ;;
+    "NeedsLogin"|"NeedsMachineAuth")
+      echo "⚠️  Tailscale daemon is running but not logged in"
+      echo "🔐 Please authenticate with Tailscale:"
+      echo "    tailscale up"
+      echo
+      echo "💡 This will give you a URL to complete authentication in your browser"
+      
+      read -rp "Would you like to run 'tailscale up' now? [y/N]: " answer
+      if [[ ${answer,,} =~ ^y(es)?$ ]]; then
+        echo "🔄 Running 'tailscale up'..."
+        tailscale up
+        if [[ $? -eq 0 ]]; then
+          echo "✅ Tailscale authentication completed"
+          return 0
+        else
+          echo "❌ Tailscale authentication failed"
+          return 1
+        fi
+      else
+        echo "❌ Tailscale authentication required"
+        return 1
+      fi
+      ;;
+    "Stopped")
+      echo "⚠️  Tailscale is installed but stopped"
+      echo "🔄 Starting Tailscale..."
+      tailscale up
+      if [[ $? -eq 0 ]]; then
+        echo "✅ Tailscale started successfully"
+        return 0
+      else
+        echo "❌ Failed to start Tailscale"
+        return 1
+      fi
+      ;;
+    *)
+      echo "❌ Tailscale status unknown: $backend_state"
+      echo "💡 Try: tailscale status"
+      echo "💡 Or check if you need to install/configure Tailscale"
+      
+      # Check for common GUI clients
+      if command -v trayscale >/dev/null 2>&1; then
+        echo "💡 Detected Trayscale - make sure it's running and connected"
+      fi
+      
+      return 1
+      ;;
+  esac
 }
-ts_ip_self(){ tailscale ip -4 2>/dev/null | head -n1 || true; }
+
 ts_ip_vps(){
-  tailscale status --json 2>/dev/null \
-  | jq -r --arg n "$VPS_NAME" '[.Peer[]? | select(.HostName==$n) | .TailscaleIPs[] | select(test(":")|not)][0] // empty'
-}
-ensure_ufw(){
-  if ufw status 2>/dev/null | grep -qi "Status: inactive"; then
-    read -rp "UFW is inactive. Enable it now? [y/N]: " A
-    [[ "${A,,}" == "y" ]] || die "UFW inactive; aborting."
-    ufw --force enable
+  local ip
+  ip=$(tailscale status --json 2>/dev/null \
+    | jq -r --arg n "$VPS_NAME" '[.Peer[]? | select(.HostName==$n) | .TailscaleIPs[] | select(test(":")|not)][0] // empty' 2>/dev/null || echo "")
+  
+  # Validate IP format
+  if [[ -n "$ip" && "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "$ip"
+  else
+    echo ""
   fi
 }
+
 prompt_port(){
-  local last; [[ -f "$STATE_DIR/last_port" ]] && last=$(cat "$STATE_DIR/last_port") || last=""
-  read -rp "Local TCP port${last:+ [$last]}: " PORT
-  PORT="${PORT:-$last}"
-  [[ "$PORT" =~ ^[0-9]{1,5}$ && $PORT -ge 1 && $PORT -le 65535 ]] || die "Invalid port"
-  echo -n "$PORT" > "$STATE_DIR/last_port"
-  echo "$PORT"
-}
-pick_scope(){
-  local vps_ip="$1"
-  echo "Allow from which source?"
-  echo "  1) VPS only ($vps_ip/32)   [recommended]"
-  echo "  2) Whole tailnet ($TAILNET_CIDR)"
-  local def="1"; [[ "$DEFAULT_SCOPE" == "tailnet" ]] && def="2"
-  read -rp "Choose 1 or 2 [$def]: " CHOICE; CHOICE="${CHOICE:-$def}"
-  [[ "$CHOICE" == "2" ]] && echo "$TAILNET_CIDR" || echo "$vps_ip/32"
-}
-nft_ensure_chain(){
-  # Create our own early INPUT chain if missing
-  if ! nft list table ${NFT_FAMILY} ${NFT_TABLE_NAME} >/dev/null 2>&1; then
-    nft add table ${NFT_FAMILY} ${NFT_TABLE_NAME}
+  local given="${1-}" last="" port=""
+  
+  if [[ -n "$given" ]]; then
+    if [[ "$given" =~ ^[0-9]{1,5}$ && $given -ge 1 && $given -le 65535 ]]; then
+      echo "$given"
+      printf '%s' "$given" > "$STATE_DIR/last_port"
+      return
+    else
+      die "Invalid port number: $given (must be 1-65535)"
+    fi
   fi
-  if ! nft list chain ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} >/dev/null 2>&1; then
-    nft add chain ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} "{ type filter hook input priority ${NFT_PRIO}; policy accept; }"
+  
+  if [[ -f "$STATE_DIR/last_port" ]]; then
+    last=$(cat "$STATE_DIR/last_port" 2>/dev/null || echo "")
   fi
-}
-nft_add_drop(){
-  local port="$1"
-  nft_ensure_chain
-  # Idempotent: check if rule exists
-  if nft list chain ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} | grep -q "iif \"tailscale0\" tcp dport ${port} counter drop"; then
-    echo "nft drop already present for tailscale0 tcp dport ${port}"
-  else
-    nft add rule ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} iif "tailscale0" tcp dport ${port} counter drop
-    echo "Added nft drop on tailscale0 tcp dport ${port}"
-  fi
-}
-nft_del_drop(){
-  local port="$1"
-  if nft list chain ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} >/dev/null 2>&1; then
-    # delete all matching rules (if multiple)
-    while nft list chain ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} | grep -q "iif \"tailscale0\" tcp dport ${port} counter drop"; do
-      nft delete rule ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} handle $(nft -a list chain ${NFT_FAMILY} ${NFT_TABLE_NAME} ${NFT_CHAIN_NAME} | awk "/iif \"tailscale0\" tcp dport ${port} counter drop/ {print \$NF}" | head -n1)
-    done
-    echo "Removed nft drop for port ${port} (if any)"
-  fi
-}
-ufw_add_allow(){
-  local src="$1" port="$2" comment="rwlt:${port}"
-  local rule="from $src to any port $port proto tcp"
-  if ufw status numbered | grep -qF "$rule"; then
-    echo "UFW rule already present: $rule"
-  else
-    ufw allow $rule comment "$comment"
-    echo "Added UFW allow: $rule"
-  fi
-}
-ufw_del_all_for_port(){
-  local port="$1"
-  # delete rules we tagged
-  mapfile -t nums < <(ufw status numbered | sed -n 's/^\[\s*\([0-9]\+\)\]\s\+\(.*\) (rwlt:'"$port"')$/\1/p')
-  if (( ${#nums[@]} )); then
-    for n in "${nums[@]}"; do ufw --force delete "$n"; done
-    echo "Removed UFW rules tagged rwlt:${port}"
-  fi
-  # also remove generic allows for common sources (VPS-only + tailnet)
-  local vps_ip; vps_ip="$(ts_ip_vps || true)"
-  for SRC in ${vps_ip:+$vps_ip/32} "$TAILNET_CIDR"; do
-    [[ -z "$SRC" ]] && continue
-    local rule="from $SRC to any port $port proto tcp"
-    if ufw status numbered | grep -qF "$rule"; then
-      ufw delete allow $rule
-      echo "Removed UFW allow: $rule"
+  
+  while true; do
+    echo
+    if [[ -n "$last" ]]; then
+      read -rp "🔌 Enter local TCP port [last used: $last]: " port
+    else
+      read -rp "🔌 Enter local TCP port (1-65535): " port
+    fi
+    
+    port="${port:-$last}"
+    
+    if [[ -z "$port" ]]; then
+      echo "⚠️  Port cannot be empty. Please enter a valid port number."
+      continue
+    fi
+    
+    if [[ "$port" =~ ^[0-9]{1,5}$ && $port -ge 1 && $port -le 65535 ]]; then
+      printf '%s' "$port" > "$STATE_DIR/last_port"
+      echo "$port"
+      return
+    else
+      echo "⚠️  Invalid port: $port (must be a number between 1-65535)"
+      last=""  # Clear last on invalid input
     fi
   done
 }
-warn_loopback(){
-  local port="$1"
-  if command -v ss >/dev/null 2>&1; then
-    echo; echo "Listening sockets on port $port:"
-    ss -lntp | awk -v p=":$port" 'NR==1 || $4 ~ p {print}'
-    local non_loop
-    non_loop=$(ss -lntpH "sport = :$port" | awk '{print $4}' | grep -vE '(^127\.0\.0\.1|^::1)' | wc -l)
-    if [[ "$non_loop" -eq 0 ]]; then
-      echo "WARNING: service appears bound only to 127.0.0.1."
-      echo "Bind to 0.0.0.0 (or your Tailscale iface) so the VPS can reach it."
+
+get_vps_ip(){
+  local vps_ip
+  
+  vps_ip="$(ts_ip_vps || true)"
+  
+  if [[ -n "$vps_ip" ]]; then
+    echo "$vps_ip"
+    return
+  fi
+  
+  echo "⚠️  VPS '$VPS_NAME' not found in Tailscale status" >&2
+  echo "💡 You can change the VPS name with: export VPS_NAME=your-vps-hostname" >&2
+  echo >&2
+  
+  while true; do
+    read -rp "🌐 Enter VPS Tailscale IPv4 address (e.g., 100.64.0.2): " ip_input
+    
+    if [[ -z "$ip_input" ]]; then
+      echo "⚠️  IP address cannot be empty"
+      continue
+    fi
+    
+    if [[ "$ip_input" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      # Additional validation for valid IP ranges
+      IFS='.' read -ra octets <<< "$ip_input"
+      local valid=true
+      for octet in "${octets[@]}"; do
+        if [[ $octet -gt 255 ]]; then
+          valid=false
+          break
+        fi
+      done
+      
+      if [[ "$valid" == true ]]; then
+        echo "$ip_input"
+        return
+      fi
+    fi
+    
+    echo "⚠️  Invalid IPv4 address format: $ip_input"
+  done
+}
+
+pick_scope(){
+  local vps_ip="$1" def="1" choice=""
+  [[ "$DEFAULT_SCOPE" == "tailnet" ]] && def="2"
+  
+  echo
+  echo "🔒 Choose access scope:"
+  echo "   1) VPS only (${vps_ip}/32) - Recommended for security"
+  echo "   2) Entire Tailnet (${TAILNET_CIDR}) - Allow all Tailscale devices"
+  echo
+  
+  while true; do
+    read -rp "Choose option [${def}]: " choice
+    choice="${choice:-$def}"
+    
+    case "$choice" in
+      1)
+        echo "${vps_ip}/32"
+        return
+        ;;
+      2)
+        echo "$TAILNET_CIDR"
+        return
+        ;;
+      *)
+        echo "⚠️  Please enter 1 or 2"
+        ;;
+    esac
+  done
+}
+
+ensure_ufw(){
+  if ! command -v ufw >/dev/null 2>&1; then
+    die "UFW (Uncomplicated Firewall) is not installed. Please install it first."
+  fi
+  
+  local status
+  status=$(ufw status 2>/dev/null || echo "inactive")
+  
+  if echo "$status" | grep -qi "Status: inactive"; then
+    echo
+    echo "🔥 UFW firewall is currently inactive"
+    read -rp "Enable UFW now? This is required for the tunnel to work [y/N]: " answer
+    if [[ ${answer,,} =~ ^y(es)?$ ]]; then
+      echo "🔄 Enabling UFW..."
+      ufw --force enable
+      echo "✅ UFW enabled successfully"
+    else
+      die "UFW must be active for this tool to work. Please enable it manually with 'sudo ufw enable'"
     fi
   fi
 }
 
+nft_ensure_chain(){
+  nft list table ${NFT_FAMILY} ${NFT_TABLE} >/dev/null 2>&1 || nft add table ${NFT_FAMILY} ${NFT_TABLE}
+  nft list chain ${NFT_FAMILY} ${NFT_TABLE} ${NFT_CHAIN} >/dev/null 2>&1 \
+    || nft add chain ${NFT_FAMILY} ${NFT_TABLE} ${NFT_CHAIN} "{ type filter hook input priority ${NFT_PRIO}; policy accept; }"
+}
+
+nft_add_drop(){
+  local port="$1"
+  nft_ensure_chain
+  
+  if nft -a list chain ${NFT_FAMILY} ${NFT_TABLE} ${NFT_CHAIN} 2>/dev/null | grep -q "iif \"tailscale0\" tcp dport ${port} "; then
+    echo "ℹ️  nftables drop rule already exists for tailscale0 tcp port ${port}"
+  else
+    nft add rule ${NFT_FAMILY} ${NFT_TABLE} ${NFT_CHAIN} iif "tailscale0" tcp dport ${port} counter drop
+    echo "🚫 Added nftables drop rule for tailscale0 tcp port ${port}"
+  fi
+}
+
+nft_del_drop(){
+  local port="$1"
+  
+  if ! nft list chain ${NFT_FAMILY} ${NFT_TABLE} ${NFT_CHAIN} >/dev/null 2>&1; then
+    return
+  fi
+  
+  # Fixed regex escaping
+  local handles
+  mapfile -t handles < <(nft -a list chain ${NFT_FAMILY} ${NFT_TABLE} ${NFT_CHAIN} \
+                        | awk "/iif \"tailscale0\" tcp dport ${port} /"' {print $NF}')
+  
+  local removed=0
+  for handle in "${handles[@]}"; do
+    if [[ -n "$handle" && "$handle" =~ ^[0-9]+$ ]]; then
+      nft delete rule ${NFT_FAMILY} ${NFT_TABLE} ${NFT_CHAIN} handle "$handle"
+      ((removed++))
+    fi
+  done
+  
+  if [[ $removed -gt 0 ]]; then
+    echo "✅ Removed $removed nftables drop rule(s) for port ${port}"
+  fi
+}
+
+ufw_add_allow(){
+  local src="$1" port="$2" comment="rwlt:${port}"
+  local rule_text="from $src to any port $port proto tcp"
+  
+  # Check if rule already exists
+  if ufw status numbered 2>/dev/null | grep -qF "$rule_text"; then
+    echo "ℹ️  UFW rule already exists: $rule_text"
+    return
+  fi
+  
+  echo "🔄 Adding UFW allow rule: $rule_text"
+  
+  # Try with comment first
+  local temp_err="/tmp/ufw_err.$$"
+  if ufw allow from "$src" to any port "$port" proto tcp comment "$comment" 2>"$temp_err"; then
+    echo "✅ UFW rule added successfully"
+    rm -f "$temp_err"
+    return
+  fi
+  
+  # Check if it's a comment syntax issue
+  if grep -qi "invalid syntax\|comment.*not.*supported" "$temp_err" 2>/dev/null; then
+    if ufw allow from "$src" to any port "$port" proto tcp 2>"$temp_err"; then
+      echo "✅ UFW rule added successfully"
+      rm -f "$temp_err"
+      return
+    fi
+  fi
+  
+  # Show error details
+  echo "❌ Failed to add UFW rule. Error details:"
+  if [[ -f "$temp_err" ]]; then
+    cat "$temp_err"
+    rm -f "$temp_err"
+  fi
+  die "Could not add UFW rule for port $port from $src"
+}
+
+ufw_del_all_for_port(){
+  local port="$1"
+  local removed=0
+  
+  # Remove rules with rwlt comment tag
+  local nums
+  mapfile -t nums < <(ufw status numbered 2>/dev/null | sed -n 's/^\[\s*\([0-9]\+\)\]\s\+\(.*\) (rwlt:'"$port"')$/\1/p' | sort -nr)
+  
+  for n in "${nums[@]}"; do
+    if [[ -n "$n" ]]; then
+      ufw --force delete "$n" >/dev/null 2>&1
+      ((removed++))
+    fi
+  done
+  
+  # Remove any other rules for this port (legacy cleanup)
+  local vps_ip
+  vps_ip="$(ts_ip_vps || true)"
+  
+  for src in ${vps_ip:+$vps_ip/32} "$TAILNET_CIDR"; do
+    [[ -z "$src" ]] && continue
+    local rule_text="from $src to any port $port proto tcp"
+    
+    if ufw status numbered 2>/dev/null | grep -qF "$rule_text"; then
+      if ufw delete allow from "$src" to any port "$port" proto tcp >/dev/null 2>&1; then
+        ((removed++))
+      fi
+    fi
+  done
+  
+  if [[ $removed -gt 0 ]]; then
+    echo "✅ Removed $removed UFW rule(s) for port ${port}"
+  fi
+}
+
+warn_loopback(){
+  local port="$1"
+  
+  if ! command -v ss >/dev/null 2>&1; then
+    echo "⚠️  'ss' command not found - cannot check listening sockets"
+    return
+  fi
+  
+  echo
+  echo "🔍 Checking listening sockets on port $port:"
+  
+  local socket_info
+  socket_info=$(ss -lntp 2>/dev/null | awk -v p=":$port" 'NR==1 {print} $4 ~ p {print}')
+  
+  if [[ -n "$socket_info" ]]; then
+    echo "$socket_info"
+    
+    local non_loopback_count
+    non_loopback_count=$(ss -lntpH "sport = :$port" 2>/dev/null | awk '{print $4}' | grep -vcE '(^127\.0\.0\.1|^::1|^localhost)' || echo "0")
+    
+    if [[ "$non_loopback_count" -eq 0 ]]; then
+      echo
+      echo "⚠️  WARNING: Service appears to be bound only to localhost (127.0.0.1)"
+      echo "💡 To allow VPS access, bind your service to:"
+      echo "   • 0.0.0.0:$port (all interfaces)"
+      echo "   • Your Tailscale interface IP"
+    else
+      echo "✅ Service is accessible from external interfaces"
+    fi
+  else
+    echo "⚠️  No service found listening on port $port"
+    echo "💡 Make sure your service is running and listening on port $port"
+  fi
+}
+
+# Monitor traffic and auto-cleanup on exit
+monitor_traffic(){
+  local port="$1" vps_ip="$2"
+  local pid_file="$STATE_DIR/monitor_${port}.pid"
+  
+  # Store our PID for cleanup
+  echo $$ > "$pid_file"
+  
+  # Cleanup function
+  cleanup() {
+    echo
+    echo "🛑 Monitor interrupted - cleaning up tunnel for port $port..."
+    nft_add_drop "$port"
+    ufw_del_all_for_port "$port"
+    rm -f "$pid_file"
+    echo "✅ Tunnel closed and access blocked"
+    exit 0
+  }
+  
+  # Set up signal handlers
+  trap cleanup INT TERM EXIT
+  
+  echo "📊 Monitoring traffic on port $port (Press Ctrl+C to stop tunnel)"
+  echo "🎯 VPS IP: $vps_ip"
+  echo "📈 Traffic will be shown below:"
+  echo "----------------------------------------"
+  
+  # Initialize counters
+  local last_packets=0 last_bytes=0
+  local current_packets current_bytes
+  
+  while true; do
+    # Get current stats from nftables if available, otherwise use netstat/ss
+    if command -v nft >/dev/null 2>&1 && nft list chain ${NFT_FAMILY} ${NFT_TABLE} ${NFT_CHAIN} >/dev/null 2>&1; then
+      # Try to get packet/byte counts from nftables rules
+      current_packets=$(nft -j list chain ${NFT_FAMILY} ${NFT_TABLE} ${NFT_CHAIN} 2>/dev/null | jq -r '.nftables[]?.rule?.expr[]?.counter?.packets // 0' | awk '{sum+=$1} END {print sum+0}')
+      current_bytes=$(nft -j list chain ${NFT_FAMILY} ${NFT_TABLE} ${NFT_CHAIN} 2>/dev/null | jq -r '.nftables[]?.rule?.expr[]?.counter?.bytes // 0' | awk '{sum+=$1} END {print sum+0}')
+    else
+      current_packets=0
+      current_bytes=0
+    fi
+    
+    # Show connection info
+    local connections
+    connections=$(ss -tn "sport = :$port or dport = :$port" 2>/dev/null | grep -v "State" | wc -l)
+    
+    # Get listening status
+    local listening
+    listening=$(ss -ln "sport = :$port" 2>/dev/null | grep -v "State" | wc -l)
+    
+    # Calculate differences
+    local packet_diff=$((current_packets - last_packets))
+    local byte_diff=$((current_bytes - last_bytes))
+    
+    # Format bytes
+    local byte_diff_human
+    if [[ $byte_diff -gt 1073741824 ]]; then
+      byte_diff_human=$(printf "%.2f GB" $(echo "$byte_diff / 1073741824" | bc -l))
+    elif [[ $byte_diff -gt 1048576 ]]; then
+      byte_diff_human=$(printf "%.2f MB" $(echo "$byte_diff / 1048576" | bc -l))
+    elif [[ $byte_diff -gt 1024 ]]; then
+      byte_diff_human=$(printf "%.2f KB" $(echo "$byte_diff / 1024" | bc -l))
+    else
+      byte_diff_human="${byte_diff} B"
+    fi
+    
+    # Show status line
+    printf "\r🔗 Port %s | Listening: %s | Connections: %s | Traffic: +%s packets (+%s)    " \
+           "$port" \
+           "$([[ $listening -gt 0 ]] && echo "✅" || echo "❌")" \
+           "$connections" \
+           "$packet_diff" \
+           "$byte_diff_human"
+    
+    # Update last values
+    last_packets=$current_packets
+    last_bytes=$current_bytes
+    
+    sleep 2
+  done
+}
+
 cmd_start(){
-  ensure_tools; need_sudo
-  local self vps port src
-  self="$(ts_ip_self || true)"; [[ -n "$self" ]] && echo "This machine's Tailscale IPv4: $self"
-  vps="$(ts_ip_vps || true)";  [[ -z "$vps" ]] && read -rp "VPS Tailscale IPv4 (e.g. 100.64.0.2): " vps
-  [[ "$vps" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "Invalid IPv4: $vps"
-  port="$(prompt_port)"
-  src="$(pick_scope "$vps")"
+  echo "🚀 Starting Tailscale tunnel setup..."
+  
+  # Check Tailscale installation and status
+  check_tailscale_installation
+  if ! check_tailscale_status; then
+    die "Tailscale is not ready. Please resolve the issues above and try again."
+  fi
+  
+  # Check other dependencies
+  local missing_deps=()
+  for cmd in jq nft; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing_deps+=("$cmd")
+    fi
+  done
+  
+  if [[ ${#missing_deps[@]} -gt 0 ]]; then
+    die "Missing required commands: ${missing_deps[*]}. Please install them first."
+  fi
+  
+  local vps_ip port src
+  
+  echo "🔍 Looking for VPS '$VPS_NAME' on Tailscale..."
+  vps_ip="$(get_vps_ip)"
+  echo "✅ Found VPS at: $vps_ip"
+  
+  port="$(prompt_port "${1-}")"
+  src="$(pick_scope "$vps_ip")"
+  
+  echo "✅ Selected: $([ "$src" = "$TAILNET_CIDR" ] && echo "Entire Tailnet ($src)" || echo "VPS only ($src)")"
+  echo
+  echo "🔧 Configuring firewall rules..."
   ensure_ufw
-  nft_del_drop "$port"                  # ensure no hard block remains
+  nft_del_drop "$port"
   ufw_add_allow "$src" "$port"
+  
   warn_loopback "$port"
-  echo; echo "✅ Port ${port} opened for ${src} over Tailscale."
-  echo "To stop later: rw-local-tunnel stop"
+  
+  echo
+  echo "✅ Tunnel setup complete!"
+  echo "🔌 Port ${port} is now accessible from ${src} via Tailscale"
+  echo "💡 Your VPS can now connect to localhost:${port} through the Tailscale network"
+  echo
+  
+  # Start monitoring automatically (this will block and handle cleanup on exit)
+  monitor_traffic "$port" "$vps_ip"
 }
 
 cmd_stop(){
-  need_sudo
-  local port; port="$(prompt_port)"
-  nft_add_drop "$port"                  # hard block on tailscale0
-  ufw_del_all_for_port "$port"          # clean any allows
-  echo; echo "🛑 Port ${port} blocked on tailscale0. (NPM will now fail to reach it.)"
+  echo "🛑 Stopping Tailscale tunnel..."
+  
+  if ! command -v nft >/dev/null 2>&1; then
+    die "nftables (nft) command not found"
+  fi
+  
+  local port
+  port="$(prompt_port "${1-}")"
+  
+  # Stop any running monitor
+  local pid_file="$STATE_DIR/monitor_${port}.pid"
+  if [[ -f "$pid_file" ]]; then
+    local monitor_pid
+    monitor_pid=$(cat "$pid_file" 2>/dev/null || echo "")
+    if [[ -n "$monitor_pid" ]] && kill -0 "$monitor_pid" 2>/dev/null; then
+      kill "$monitor_pid" 2>/dev/null || true
+      echo "🔄 Stopped running monitor for port $port"
+    fi
+    rm -f "$pid_file"
+  fi
+  
+  echo "🔧 Blocking access and cleaning up rules..."
+  nft_add_drop "$port"
+  ufw_del_all_for_port "$port"
+  
+  echo
+  echo "🛑 Tunnel stopped successfully!"
+  echo "🚫 Port ${port} is now blocked on Tailscale interface"
+  echo "💡 Your VPS can no longer reach localhost:${port}"
+}
+
+cmd_monitor(){
+  echo "📊 Starting Tailscale tunnel with traffic monitoring..."
+  
+  # Check Tailscale installation and status
+  check_tailscale_installation
+  if ! check_tailscale_status; then
+    die "Tailscale is not ready. Please resolve the issues above and try again."
+  fi
+  
+  # Check other dependencies
+  local missing_deps=()
+  for cmd in jq nft; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing_deps+=("$cmd")
+    fi
+  done
+  
+  if [[ ${#missing_deps[@]} -gt 0 ]]; then
+    die "Missing required commands: ${missing_deps[*]}. Please install them first."
+  fi
+  
+  local vps_ip port src
+  
+  echo "🔍 Looking for VPS '$VPS_NAME' on Tailscale..."
+  vps_ip="$(get_vps_ip)"
+  echo "✅ Found VPS at: $vps_ip"
+  
+  port="$(prompt_port "${1-}")"
+  src="$(pick_scope "$vps_ip")"
+  
+  echo "✅ Selected: $([ "$src" = "$TAILNET_CIDR" ] && echo "Entire Tailnet ($src)" || echo "VPS only ($src)")"
+  echo
+  echo "🔧 Configuring firewall rules..."
+  ensure_ufw
+  nft_del_drop "$port"
+  ufw_add_allow "$src" "$port"
+  
+  warn_loopback "$port"
+  
+  echo
+  echo "✅ Tunnel setup complete!"
+  echo
+  
+  # Start monitoring (this will block and handle cleanup on exit)
+  monitor_traffic "$port" "$vps_ip"
 }
 
 cmd_shields(){
-  ensure_tools; need_sudo
-  case "${1:-}" in
-    on)  tailscale set --shields-up=true;  echo "Shields Up enabled (all inbound blocked).";;
-    off) tailscale set --shields-up=false; echo "Shields Up disabled.";;
-    *)   echo "Usage: rw-local-tunnel shields on|off"; exit 1;;
+  check_tailscale_installation
+  if ! check_tailscale_status; then
+    die "Tailscale is not ready. Please resolve the issues above and try again."
+  fi
+  
+  case "${1-}" in
+    on)
+      echo "🛡️  Enabling Tailscale shields up..."
+      tailscale set --shields-up=true
+      echo "✅ Shields up enabled - incoming connections blocked"
+      ;;
+    off)
+      echo "🔓 Disabling Tailscale shields up..."
+      tailscale set --shields-up=false
+      echo "✅ Shields up disabled - incoming connections allowed"
+      ;;
+    *)
+      echo "Usage: rw-local-tunnel shields on|off"
+      echo "  on  - Block all incoming connections (shields up)"
+      echo "  off - Allow incoming connections (shields down)"
+      exit 1
+      ;;
   esac
 }
 
 usage(){
   cat <<EOF
-Usage:
-  rw-local-tunnel start      # open a local port to VPS (or tailnet), remove any nft drop
-  rw-local-tunnel stop       # hard-block that port on tailscale0 and remove UFW allows
-  rw-local-tunnel shields on|off   # optional global inbound toggle
+🌐 Tailscale Local Tunnel Manager
 
-Env:
-  VPS_NAME=<host>            (default: vpn)
-  DEFAULT_SCOPE=vps|tailnet  (default: vps)
+Usage:
+  rw-local-tunnel start [PORT]    - Open a local port with live traffic monitoring (auto-closes on exit)
+  rw-local-tunnel stop  [PORT]    - Close/block a previously opened port
+  rw-local-tunnel monitor [PORT]  - Same as start (kept for compatibility)
+  rw-local-tunnel shields on|off  - Enable/disable Tailscale shields up
+
+Environment Variables:
+  VPS_NAME         - Hostname of your VPS in Tailscale (default: 'vpn')
+  TAILNET_CIDR     - Your Tailnet CIDR range (default: '100.64.0.0/10')
+  DEFAULT_SCOPE    - Default access scope: 'vps' or 'tailnet' (default: 'vps')
+
+Examples:
+  rw-local-tunnel start 3000      - Open port 3000 with live monitoring
+  rw-local-tunnel start           - Interactive mode with monitoring
+  rw-local-tunnel stop 8080       - Close port 8080
+  VPS_NAME=myserver rw-local-tunnel start 8080
+
+How it works:
+  • 'start' opens the tunnel and shows real-time traffic monitoring
+  • When you close the terminal or press Ctrl+C, the tunnel automatically closes
+  • Use 'stop' if you need to close a tunnel from a different terminal
 EOF
 }
 
-main(){
-  case "${1:-}" in
-    start) shift; cmd_start "$@";;
-    stop)  shift; cmd_stop  "$@";;
-    shields) shift; cmd_shields "$@";;
-    *) usage; exit 1;;
-  esac
-}
-main "$@"
+# --- entrypoint with arg-safe sudo ---
+sub="${1-}"
+shift || true
+
+if [[ $EUID -ne 0 ]]; then
+  # re-exec with sudo, preserving subcommand + args and environment
+  exec sudo --preserve-env=VPS_NAME,TAILNET_CIDR,DEFAULT_SCOPE,STATE_DIR,NFT_PRIO,NFT_TABLE,NFT_CHAIN "$0" "${sub:-}" "$@"
+fi
+
+case "${sub:-}" in
+  start)   cmd_start "${1-}";;
+  stop)    cmd_stop  "${1-}";;
+  monitor) cmd_monitor "${1-}";;
+  shields) cmd_shields "${1-}";;
+  *)       usage; exit 1;;
+esac
